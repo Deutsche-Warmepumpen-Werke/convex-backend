@@ -22,7 +22,7 @@ the checked sum of:
 - `UDF_CACHE_MAX_SIZE` and `INDEX_CACHE_SIZE`;
 - `SOURCE_MAP_CACHE_MAX_SIZE_BYTES`, `FUNRUN_INDEX_CACHE_SIZE`,
   `FUNRUN_MODULE_CACHE_SIZE`, and `FUNRUN_CODE_CACHE_SIZE`;
-- `LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES`; and
+- `LOCAL_NODE_EXECUTOR_TOTAL_RSS_BUDGET_BYTES`; and
 - `LOCAL_BACKEND_NATIVE_KERNEL_MEMORY_RESERVE_BYTES`, which defaults to 2 GiB.
 
 The reserve covers allocations without a separate configured ceiling,
@@ -54,7 +54,10 @@ metrics. `isolate_memory_capacity_bytes` independently retains the raw
 per-worker and aggregate runtime ceilings. The periodic process, allocator, and
 cgroup metrics remain the source for actual use.
 
-The local Node executor also has independent lifetime controls:
+The local Node executor also has independent lifetime controls. The global RSS
+threshold is the fallback for application pools and is always used by the
+internal `_system` pool; a named application pool can override it with
+`maxRssBytes` in `LOCAL_NODE_EXECUTOR_POOL_POLICIES` as described below:
 
 - `LOCAL_NODE_EXECUTOR_MAX_OLD_SPACE_SIZE_MIB`, default `2048`;
 - `LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES`, default `3221225472` (3 GiB);
@@ -67,17 +70,24 @@ V8 old space excludes Buffers, native modules, executable code, and allocator
 retention, so the RSS threshold must remain larger and is validated
 independently. The age and lifetime-unique imported source-package thresholds
 bound growth that disk-cache eviction cannot reclaim from Node's ESM module
-graph. When any threshold is reached, the generation stops accepting new
-requests and starts detached drain completion. The watchdog continues health
-checks while in-flight requests finish; repeated health failure can preempt a
-stuck drain. A healthy drained generation is terminated and reaped before the
-next request starts a replacement generation.
+graph. While cgroup headroom is healthy, reaching the RSS, age, or package
+threshold requests hot replacement. The current generation keeps accepting
+eligible requests while a candidate starts, passes health checks, and prepares
+its required packages. Promotion atomically selects the candidate as current
+and closes old admission. Requests already assigned to the old generation
+finish within their existing absolute deadlines before it is terminated and
+reaped. The watchdog continues health checks during that drain; repeated
+health failure can terminate a stuck old generation. If the retained package
+authority is already expired when a healthy trigger is observed, the generation
+drains without a candidate because no signer is available at that boundary; the
+next request cold-starts with fresh authority.
 
 The watchdog normally observes direct-child RSS roughly every one to two
-seconds. An active invocation can delay healthy proactive drain completion
-until its remaining Rust deadline expires, up to 605 seconds with the default
-Node action timeout, and termination/reaping can take longer. It does not delay
-the unhealthy-watchdog threshold. Non-Linux builds report RSS sampling as
+seconds. After promotion, an active invocation can keep the old draining
+generation and the global surge slot occupied until its remaining Rust
+deadline expires, up to 605 seconds with the default Node action timeout;
+termination and reaping can take longer. It does not delay the
+unhealthy-watchdog threshold. Non-Linux builds report RSS sampling as
 unsupported and do not use the RSS trigger. A failed Linux sample marks RSS
 telemetry unavailable and skips only that trigger for the iteration; age,
 package, and unhealthy-generation checks continue. The RSS byte gauge retains
@@ -86,6 +96,112 @@ telemetry-availability gauge.
 
 The stock Compose file passes these controls through without setting
 different defaults. Changing one requires a backend restart.
+
+## Application-declared local Node executor pools
+
+A root Node action module can require a dedicated local executor pool by placing
+both directives in its source prologue:
+
+```ts
+"use node";
+"use node pool:consumer";
+```
+
+The declaration applies to every export in the module. Pool names must match
+`[a-z][a-z0-9_]{0,31}`, `default` is reserved, and one committed deployment can
+use at most eight distinct names. Components do not support Node modules.
+Modules without a pool declaration use the default application executor.
+Package analysis and dependency builds use a separate internal `_system`
+executor that cannot run application actions.
+
+`LOCAL_NODE_EXECUTOR_POOL_POLICIES` can override the memory settings for an
+application pool with `maxOldSpaceSizeMib`, `maxRssBytes`, and
+`memoryPressureMinRssBytes`. Pools without a field use the corresponding
+global setting. The reserved internal `_system` pool always uses all global
+values. Each effective old-space and pressure setting must remain below that
+pool's effective `maxRssBytes`; this permits a small pool to use a smaller V8
+heap and pressure boundary rather than inheriting the global 2 GiB values.
+`LOCAL_NODE_EXECUTOR_TOTAL_RSS_BUDGET_BYTES` is the host resource policy for
+these processes. With `Rdefault` as the effective default-pool threshold,
+`Rsystem` as the global threshold, and `Rpool` as each effective named-pool
+threshold, a deployment requires:
+
+```text
+Rdefault + Rsystem + sum(Rpool) +
+  max(Rdefault, every Rpool)
+```
+
+The backend rejects a proposed deployment when this sum exceeds the total
+budget. It also validates the committed topology during startup. Linux startup
+memory feasibility reserves the configured total directly, including capacity
+for lazy steady slots and the lazy surge slot whose Node child has not started.
+The surge reserve uses one complete allowance for the largest possible
+application generation or candidate, not an estimate of a fresh process's
+expected RSS. Each configured threshold must remain above the old-space and
+cgroup-pressure RSS thresholds.
+If `LOCAL_NODE_EXECUTOR_TOTAL_RSS_BUDGET_BYTES` is unset, its default is
+`Rdefault + Rsystem + Rdefault`; with no `default` RSS override this is three
+times `LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES` (9 GiB with the documented defaults).
+
+The internal system child starts lazily. It admits one `Analyze` or `BuildDeps`
+operation at a time across both kinds. At most eight callers wait in FIFO order,
+and admission fails after 60 seconds. These bounds are intrinsic runtime policy,
+not environment knobs. Admission occurs before package or upload URLs are
+signed, so queued work either receives fresh authority after admission or fails
+without starting child work. Analysis package URLs remain valid for 120 seconds
+and dependency upload URLs for the configured Node action timeout plus 65
+seconds (665 seconds with the default 600-second timeout), budgeting the local
+build request deadline plus one nominal minute for bounded startup of the lazy
+system child. Signing, scheduling, and dispatch consume the same finite
+authority; this validity is not a separate request deadline. A caller that
+disappears after dispatch does not release the active slot or stop the local
+request timer; the runtime-owned operation retains both through the child result
+and cleanup, then records whether the original result receiver was still
+present. System recycling is cold and does not use the application
+hot-replacement surge slot.
+
+`HTTP_SERVER_TIMEOUT_SECONDS` is an independent outer request deadline and
+defaults to 300 seconds. It covers the complete deployment, codegen, or
+explicit dependency-preparation handler after HTTP admission. Its
+HTTP 408 can end the caller before the longer dependency build finishes;
+runtime ownership still continues through terminal child cleanup, but the
+canceled application caller does not resume package-record publication, and
+the CLI does not retry that POST on a 408. These workflows can include package
+publication, source upload, and later analysis in addition to the build, so no
+single child URL lifetime defines a correct outer deadline. Increase this
+setting and every upstream timeout when the complete initiating workflow is
+intended to permit builds longer than five minutes.
+
+Named pools inherit the ordinary timeout, health, lifetime, and diagnostic
+controls; each memory setting uses its named policy override or the global
+fallback described above. The effective per-pool memory settings are exported
+through the existing old-space, RSS-retirement, and pressure-threshold gauges.
+A named generation is replaced when its selected source package or effective
+environment changes. Committed module membership changes also hot-replace every
+affected resident named generation and the default generation when its exact
+routed module set changes. Removed named slots close admission and drain. One
+global surge slot serializes candidate startup, promotion, and old-generation
+drain across the default and named pools. A named-pool failure does not fall
+back to default.
+
+Changing `LOCAL_NODE_EXECUTOR_TOTAL_RSS_BUDGET_BYTES` requires a backend
+restart. Adding, removing, or moving source declarations takes effect only after
+the deployment commits. A deployment that needs a resident cutover reserves
+surge capacity before commit and waits at most 120 seconds. Ordinary deployment
+requests omit the optional force field and remain compatible with older CLIs.
+`--force-node-cutover` additionally requires cutover capability version 1 from
+the backend; it can cancel an unpromoted routine candidate or terminate a
+superseded old draining generation after warning that interrupted actions may
+already have external effects. It never terminates the only serving current
+generation to obtain capacity.
+
+For rollout, first rebalance the finite cgroup budget so the configured total,
+including the complete surge allowance, passes startup feasibility. Replace the
+backend with one that advertises cutover capability version 1 before enabling
+the force option in a CLI. Pool declarations can be deployed after that
+backend is active. For rollback to a backend without pool support, first deploy
+source without every pool declaration using the compatible backend and CLI,
+then replace the backend; remove the force-capable CLI afterward if required.
 
 ## Backend process allocator
 
@@ -138,11 +254,15 @@ On entry, the controller first evaluates an optional glibc trim and resamples cg
 pressure remains, it publishes one shared signal. When the bounded context-reuse patch is also
 carried, idle isolates drop their fresh context, prune the reusable cache from its normal
 one-probationary-plus-five-protected capacity to the two strongest protected entries, suppress new
-reusable admission, and ask V8 to collect after removing roots. The local Node watchdog gracefully
-retires its generation only after the signal has remained active for
+reusable admission, and ask V8 to collect after removing roots. The local Node watchdog retires its
+current generation without starting a candidate only after the signal has remained active for
 `LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_GRACE_SECS` and a successful direct-child RSS sample reaches
-`LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_MIN_RSS_BYTES`. The ordinary Node RSS limit remains the
-higher-priority retirement reason.
+`LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_MIN_RSS_BYTES`. While the signal is active,
+ordinary healthy RSS, package-count, and age replacement is suppressed. The
+controller cancels any unpromoted candidate and immediately terminates an old
+generation already draining after promotion; the surge slot remains occupied
+until direct-child reaping is confirmed. The ordinary Node RSS limit is the
+first proactive decision only while cgroup headroom is healthy.
 
 A new shared-pressure entry waits behind an in-flight trim only while headroom is above
 `LOCAL_BACKEND_MEMORY_PRESSURE_ENTER_HEADROOM_BYTES`. At or below that value, owner reclamation
