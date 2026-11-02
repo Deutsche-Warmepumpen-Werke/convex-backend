@@ -1,0 +1,165 @@
+name: Self-Hosted Images
+
+# Builds the self-hosted backend and dashboard from one revision. Each image is
+# pushed as :<sha>; both move to :main together only after the backend passes
+# a deploy smoke test, because the dashboard depends on matching backend
+# system UDFs.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  BACKEND_IMAGE: ghcr.io/deutsche-warmepumpen-werke/convex-backend
+  DASHBOARD_IMAGE: ghcr.io/deutsche-warmepumpen-werke/convex-dashboard
+
+jobs:
+  backend:
+    name: Build backend image
+    runs-on: blacksmith-16vcpu-ubuntu-2404
+    timeout-minutes: 240
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Set up Blacksmith Docker builder
+        uses: useblacksmith/setup-docker-builder@2068193c703dab9ecee787ac50d4f9100e57574a # v2.2.0
+        with:
+          cache-key: convex-backend
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get commit timestamp
+        run:
+          echo "COMMIT_TIMESTAMP=$(git log -1 --format='%aI' | date -f - --utc
+          '+%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_ENV"
+
+      - name: Build and push backend
+        uses: useblacksmith/build-push-action@9b0579bbec7a6cad2f171596c57e7ac1e7658850 # v2.3.0
+        with:
+          context: .
+          file: self-hosted/docker-build/Dockerfile.backend
+          push: true
+          provenance: false
+          tags: ${{ env.BACKEND_IMAGE }}:${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          build-args: |
+            VERGEN_GIT_SHA=${{ github.sha }}
+            VERGEN_GIT_COMMIT_TIMESTAMP=${{ env.COMMIT_TIMESTAMP }}
+
+  dashboard:
+    name: Build dashboard image
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Set up Blacksmith Docker builder
+        uses: useblacksmith/setup-docker-builder@2068193c703dab9ecee787ac50d4f9100e57574a # v2.2.0
+        with:
+          cache-key: convex-dashboard
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push dashboard
+        uses: useblacksmith/build-push-action@9b0579bbec7a6cad2f171596c57e7ac1e7658850 # v2.3.0
+        with:
+          context: .
+          file: self-hosted/docker-build/Dockerfile.dashboard
+          push: true
+          provenance: false
+          tags: ${{ env.DASHBOARD_IMAGE }}:${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+  smoke_test:
+    name: Deploy to backend image
+    needs: backend
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    services:
+      backend:
+        image: ghcr.io/deutsche-warmepumpen-werke/convex-backend:${{ github.sha }}
+        credentials:
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+        env:
+          V8_ACTION_USER_TIMEOUT_SECS: "20"
+          NODE_ACTION_USER_TIMEOUT_SECS: "20"
+          CONVEX_CLOUD_ORIGIN: "http://127.0.0.1:3210"
+          CONVEX_SITE_ORIGIN: "http://127.0.0.1:3211"
+          DISABLE_BEACON: "true"
+        ports:
+          - "3210:3210"
+          - "3211:3211"
+        options: >-
+          --health-cmd "curl -f http://localhost:3210/version" --health-interval
+          10s --health-timeout 5s --health-retries 10 --health-start-period 10s
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install mise tools
+        uses: jdx/mise-action@dba19683ed58901619b14f395a24841710cb4925 # v4.1.0
+        with:
+          cache: true
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: NPM install globals
+        run: npm ci --prefix scripts
+
+      - name: Build NPM packages
+        run: |
+          just install-js
+          just turbo run build --filter=test-project...
+
+      - name: Push functions to the backend
+        working-directory: npm-packages/private-demos/test-project
+        run: |
+          ADMIN_KEY=$(docker exec ${{ job.services.backend.id }} ./generate_admin_key.sh)
+          npx convex deploy --url http://127.0.0.1:3210 --admin-key "$ADMIN_KEY"
+
+      - name: Verify the deployment serves HTTP actions
+        run: test "$(curl -fsS http://127.0.0.1:3211)" = "Hello world!"
+
+  tag_main:
+    name: Tag images as main
+    needs: [backend, dashboard, smoke_test]
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 10
+    steps:
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Move main tags to this revision
+        run: |
+          for image in "$BACKEND_IMAGE" "$DASHBOARD_IMAGE"; do
+            docker buildx imagetools create --tag "$image:main" "$image:${GITHUB_SHA}"
+          done
