@@ -7,7 +7,6 @@
 use std::{
     self,
     sync::Arc,
-    time::Duration,
 };
 
 use ::authentication::{
@@ -35,6 +34,7 @@ use common::{
         NODE_ACTION_USER_TIMEOUT,
         UDF_CACHE_MAX_SIZE,
     },
+    memory_pressure::MemoryPressureSignal,
     persistence::Persistence,
     runtime::{
         new_rate_limiter,
@@ -71,7 +71,10 @@ use model::{
     virtual_system_mapping,
 };
 use node_executor::{
-    local::LocalNodeExecutor,
+    local::{
+        LocalNodeExecutor,
+        LocalNodeExecutorConfig,
+    },
     NodeActions,
 };
 use runtime::prod::ProdRuntime;
@@ -82,6 +85,117 @@ use search::{
 };
 use serde::Serialize;
 pub use sync::subscription_reconnect::SubscriptionReconnectRateLimiter;
+#[cfg(local_backend_jemalloc)]
+use tikv_jemalloc_sys as _;
+#[cfg(local_backend_jemalloc)]
+use tikv_jemallocator::Jemalloc;
+
+#[cfg(local_backend_jemalloc)]
+#[global_allocator]
+static ALLOCATOR: Jemalloc = Jemalloc;
+
+#[cfg(local_backend_jemalloc)]
+union JemallocConfigurationPointer {
+    byte: &'static u8,
+    character: &'static libc::c_char,
+}
+
+#[cfg(local_backend_jemalloc)]
+pub(crate) const JEMALLOC_BACKGROUND_THREAD_SUPPORTED: bool = cfg!(all(
+    unix,
+    not(target_vendor = "apple"),
+    not(target_env = "musl")
+));
+
+#[cfg(local_backend_jemalloc)]
+const JEMALLOC_MALLOC_CONF_BYTES: &[u8] = if JEMALLOC_BACKGROUND_THREAD_SUPPORTED {
+    b"abort_conf:true,background_thread:true,narenas:32,prof:false\0"
+} else {
+    b"abort_conf:true,narenas:32,prof:false\0"
+};
+
+#[cfg(local_backend_jemalloc)]
+#[cfg_attr(
+    any(
+        target_vendor = "apple",
+        target_os = "android",
+        target_os = "dragonfly"
+    ),
+    unsafe(export_name = "_rjem_malloc_conf")
+)]
+#[cfg_attr(
+    not(any(
+        target_vendor = "apple",
+        target_os = "android",
+        target_os = "dragonfly"
+    )),
+    unsafe(export_name = "malloc_conf")
+)]
+pub static JEMALLOC_MALLOC_CONF: Option<&'static libc::c_char> = Some(unsafe {
+    // jemalloc reads a `const char *` before main. Keep the exported static in
+    // that exact C ABI shape rather than relying on a Rust slice-fat-pointer
+    // layout.
+    JemallocConfigurationPointer {
+        byte: &JEMALLOC_MALLOC_CONF_BYTES[0],
+    }
+    .character
+});
+
+#[cfg(all(
+    test,
+    local_backend_jemalloc,
+    any(not(unix), target_vendor = "apple", target_env = "musl")
+))]
+#[test]
+fn unsupported_background_thread_target_omits_the_option() {
+    // SAFETY: the backend exports this symbol as a non-null pointer to a
+    // static NUL-terminated configuration string.
+    let malloc_conf = unsafe {
+        let malloc_conf = tikv_jemalloc_sys::malloc_conf.unwrap();
+        std::ffi::CStr::from_ptr(malloc_conf)
+    };
+    assert_eq!(
+        malloc_conf.to_bytes(),
+        b"abort_conf:true,narenas:32,prof:false"
+    );
+}
+
+#[cfg(all(
+    test,
+    local_backend_jemalloc,
+    not(any(target_os = "android", target_os = "dragonfly"))
+))]
+#[test]
+fn libc_allocations_use_the_process_jemalloc() {
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        assert_eq!(
+            tikv_jemalloc_sys::malloc as *const (),
+            libc::malloc as *const ()
+        );
+        assert_eq!(
+            tikv_jemalloc_sys::calloc as *const (),
+            libc::calloc as *const ()
+        );
+        assert_eq!(
+            tikv_jemalloc_sys::realloc as *const (),
+            libc::realloc as *const ()
+        );
+        assert_eq!(
+            tikv_jemalloc_sys::free as *const (),
+            libc::free as *const ()
+        );
+    }
+    // SAFETY: the override feature binds both APIs to the same process
+    // allocator. This also checks Apple's allocator-zone override, where the
+    // prefixed jemalloc and libc entry-point addresses intentionally differ.
+    unsafe {
+        let allocation = libc::malloc(4096);
+        assert!(!allocation.is_null());
+        assert!(tikv_jemallocator::usable_size(allocation) >= 4096);
+        libc::free(allocation);
+    }
+}
 
 pub mod admin;
 mod ai_gateway;
@@ -103,6 +217,8 @@ pub mod environment_variables;
 pub mod http_actions;
 pub mod integrations;
 pub mod logs;
+#[cfg(target_os = "linux")]
+pub mod memory_metrics;
 pub mod node_action_callbacks;
 pub mod parse;
 pub mod proxy;
@@ -157,6 +273,8 @@ pub async fn make_app(
     persistence: Arc<dyn Persistence>,
     zombify_rx: async_broadcast::Receiver<()>,
     preempt_tx: ShutdownSignal,
+    memory_reclamation: MemoryPressureSignal,
+    node_executor_config: LocalNodeExecutorConfig,
 ) -> anyhow::Result<LocalAppState> {
     let key_broker = config.key_broker()?;
     let in_process_searcher = Arc::new(InProcessSearcher::new(runtime.clone())?);
@@ -203,8 +321,8 @@ pub async fn make_app(
         region: None,
         class: DeploymentClass::S16,
     };
-    let node_process_timeout = *NODE_ACTION_USER_TIMEOUT + Duration::from_secs(5);
-    let node_executor = Arc::new(LocalNodeExecutor::new(node_process_timeout).await?);
+    let node_executor =
+        Arc::new(LocalNodeExecutor::new_with_configuration(node_executor_config).await?);
     let node_actions = NodeActions::new(
         node_executor,
         config.convex_origin_url()?,
