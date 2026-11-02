@@ -164,6 +164,21 @@ Trim failure is an optional-recovery failure. It is counted and logged, but it d
 shared pressure signal or the Node consumer. A diagnostic or allocator failure must not disable the
 remaining reclamation actions while cgroup headroom is low.
 
+## Context-reuse integration
+
+This patch defines and publishes the process-wide pressure signal but does not add a dependency on
+context reuse. The separate [`context_reuse`](../context_reuse/README.md) patch is applied on top of
+this patch and consumes the signal.
+
+When both patches are carried, each idle isolate drops its separate fresh context, evicts the
+probationary resident, removes the weakest protected residents until only the two strongest remain,
+and requests V8 low-memory collection after removing roots. The context patch also suppresses new
+and probationary reusable admission while pressure is active and owns the corresponding cache
+operation, clear-reason, and cardinality contracts.
+
+This ordering keeps the generic memory controller useful without context reuse and keeps V8 cache
+policy in the patch that owns the cache.
+
 ## Local Node reclamation
 
 The local Node watchdog observes the same pressure signal. After continuous pressure for
