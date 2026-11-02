@@ -738,6 +738,42 @@ test("source package metadata rejects orphan source maps", async () => {
   }
 });
 
+test("source package metadata accepts a null external deps key", async () => {
+  const zip = new AdmZip();
+  zip.addFile(
+    "metadata.json",
+    Buffer.from(
+      JSON.stringify({
+        modulePaths: ["actions/example.js"],
+        moduleEnvironments: [["actions/example.js", "node"]],
+        externalDepsStorageKey: null,
+      }),
+    ),
+  );
+  zip.addFile(
+    "modules/actions/example.js",
+    Buffer.from("export const value = 1;\n"),
+  );
+  const sourceZip = zip.toBuffer();
+  const server = await startPackageServer({
+    "/source.zip": sourceZip,
+  });
+
+  try {
+    await expect(
+      maybeDownloadAndLinkPackages(
+        makeSourceOnlyPackage(
+          `${server.baseUrl}/source.zip`,
+          sha256(sourceZip),
+          "null-external-deps-package",
+        ),
+      ),
+    ).resolves.toBeDefined();
+  } finally {
+    await server.close();
+  }
+});
+
 test("prebuild initialization clears package roots from a prior runtime", async () => {
   const sourceRoot = path.join(tmpdir!, "source");
   const externalRoot = path.join(tmpdir!, "external_deps");

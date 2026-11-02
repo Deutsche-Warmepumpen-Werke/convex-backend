@@ -64,7 +64,11 @@ const metadataJsonSchema = z.object({
   moduleEnvironments: z
     .array(z.tuple([modulePathSchema, moduleEnvironmentSchema]))
     .optional(),
-  externalDepsStorageKey: z.string().optional(),
+  // The backend writes null when a deployment has no external packages.
+  externalDepsStorageKey: z
+    .string()
+    .nullish()
+    .transform((key) => key ?? undefined),
 });
 
 class PackageCacheError extends Error {}
