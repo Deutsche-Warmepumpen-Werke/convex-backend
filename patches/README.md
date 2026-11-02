@@ -164,6 +164,17 @@ chain.
 - Rollback: disable the deployment lane first, then lane-aware queueing if necessary; both require a
   backend restart and leave the dependency-capacity patch intact.
 
+### [Scheduled action admission before durable claim](scheduled_action_admission/README.md)
+
+- Purpose: admit scheduled and cron actions to environment-specific execution capacity before
+  committing their monotonic at-most-once `Pending -> InProgress` claim.
+- Prerequisites: the maintained dependency-capacity and isolate queue-control commits; lane-aware
+  queueing may remain disabled.
+- Activation: automatic for scheduled and cron actions after the patched backend starts; no new
+  knob or data migration is required.
+- Rollback: restore the prior backend image. Existing `InProgress` jobs retain conservative
+  at-most-once recovery, and must not be moved back to `Pending`.
+
 ### [Runtime observability](runtime_health_dashboard/README.md)
 
 - Purpose: report observed queueing without unsupported saturation claims and display
@@ -237,15 +248,17 @@ These files preserve the full earlier analysis without creating additional opera
 
 1. Apply standalone import, build, and Node-package reliability fixes as needed.
 2. Deploy dependency capacity before lane-aware queueing or the deployment lane.
-3. Add shared-base HTTP admission when Node callbacks need outer-service headroom; size it from its
+3. Deploy scheduled-action pre-claim admission after those scheduler patches; it protects both the
+   legacy CoDel and lane-aware queue paths.
+4. Add shared-base HTTP admission when Node callbacks need outer-service headroom; size it from its
    own wait and occupancy signals.
-4. Deploy the unified context-reuse patch before enabling reviewed module policy properties.
-5. Enable reviewed context-reuse properties in application-owned stages; consider prewarming only
+5. Deploy the unified context-reuse patch before enabling reviewed module policy properties.
+6. Enable reviewed context-reuse properties in application-owned stages; consider prewarming only
    after cold-miss evidence.
-6. Deliver matching backend and client protocol before enabling degradable frontend behavior.
-7. Add deployment-analysis pacing after degradable admission; validate capacity transfer with a
+7. Deliver matching backend and client protocol before enabling degradable frontend behavior.
+8. Add deployment-analysis pacing after degradable admission; validate capacity transfer with a
    controlled multi-module push before changing analysis concurrency or queue deadlines.
-8. Change one independent capacity or semantic opt-in at a time unless the documented policy
+9. Change one independent capacity or semantic opt-in at a time unless the documented policy
    explicitly requires a coupled rollout and rollback order.
 
 Keep deployment-specific names out of generic backend logic and infrastructure metric labels.
